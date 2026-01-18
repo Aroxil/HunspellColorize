@@ -9,88 +9,154 @@ const char *aff_path = "/usr/share/hunspell/en_US.aff";
 const char *dic_path = "/usr/share/hunspell/en_US.dic";
 
 #define START "\033[1m"
-#define STOP "\033[0m"
+#define STOP "\033[22m"
 
-static int check_word(Hunhandle *hunhandle, const char *word, size_t len)
+#define SMALLBUF 80
+
+struct state {
+	Hunhandle *hunhandle;
+	enum {
+		Newline,
+		Noise,
+		Word,
+		NotAWord,
+		Escape,
+	} state;
+	int esclen;
+	char escape[SMALLBUF];
+	int wordlen;
+	char word[SMALLBUF];
+	int resetlen;
+	char reset[SMALLBUF];
+};
+
+static int check_word(struct state *st)
 {
-	char buf[80];
-
 	// We're not doing German of Finnish...
-	if (len >= sizeof(buf))
+	if (st->wordlen == SMALLBUF)
 		return 1;
-
-	memcpy(buf, word, len);
-	buf[len] = 0;
-	return Hunspell_spell(hunhandle, buf);
+	st->word[st->wordlen] = 0;
+	return Hunspell_spell(st->hunhandle, st->word);
 }
 
-static void check_and_print(Hunhandle *hunhandle, const char *word, size_t len)
+static void check_and_print(struct state *st)
 {
-	if (check_word(hunhandle, word, len)) {
-		write(1, word, len);
+	if (check_word(st)) {
+		write(1, st->word, st->wordlen);
 		return;
 	}
 
 	write(1, START, strlen(START));
-	write(1, word, len);
+	write(1, st->word, st->wordlen);
 	write(1, STOP, strlen(STOP));
+	write(1, st->reset, st->resetlen);
+}
+
+static void handle_escape(struct state *st, char c)
+{
+	if (st->esclen < SMALLBUF)
+		st->escape[st->esclen++] = c;
+}
+
+static void remember_escape(struct state *st)
+{
+	st->resetlen = st->esclen;
+	memcpy(st->reset, st->escape, st->esclen);
 }
 
 // Print a single line, colorizing unrecognized words
 //
 // This is incredibly stupid, and only handles plain
 // US-ASCII text.
-static void print_one_line(Hunhandle *hunhandle, const char *line)
+static void process(struct state *st, const char *buf, size_t len)
 {
-	const char *last = line, *begin = NULL;
-	unsigned char c;
-	bool not_a_word = false;
+	const char *last = buf;
 
-	for (unsigned char c; (c = *line) != 0 ; line++) {
-		switch (*line) {
+	for ( ; len > 0 ; len--, buf++) {
+		unsigned char c = *buf;
+		switch (c) {
+		case 128 ... 255:
 		case 'A' ... 'Z':
 		case 'a' ... 'z':
-			if (begin)
+			switch (st->state) {
+			case Word:
+				if (st->wordlen == SMALLBUF) {
+					write(1, st->word, SMALLBUF);
+					st->state = NotAWord;
+					continue;
+				}
+				st->word[st->wordlen++] = c;
 				continue;
-			if (last != line) {
-				write(1, last, line-last);
-				last = line;
+			case NotAWord:
+				continue;
+			case Escape:
+				handle_escape(st, c);
+				if (c == 'm')
+					remember_escape(st);
+				st->state = Noise;
+				continue;
+			default:
+				if (last < buf)
+					write(1, last, buf-last);
+				st->state = Word;
+				st->wordlen = 1;
+				st->word[0] = c;
+				continue;
 			}
-			begin = line;
-			continue;
 
 		// Mixed letters and numbers / underscores are C identifiers
 		case '0' ... '9':
 		case '_':
-			not_a_word = true;
-			continue;
+			switch (st->state) {
+			case Escape:
+				handle_escape(st, c);
+				continue;
+			case Word:
+				write(1, st->word, st->wordlen);
+				last = buf;
+				st->state = NotAWord;
+				continue;
+			default:
+				st->state = NotAWord;
+				continue;
+			}
 
 		// Special case
 		case '\'':
-			if (begin && !not_a_word && isalpha(line[1]))
-				continue;
-			/* fallthrough */
-		default:
-			if (!begin) {
-				not_a_word = false;
+			if (st->state == Word && len > 1 && isalpha(buf[1]) && st->wordlen < SMALLBUF) {
+				st->word[st->wordlen++] = c;
 				continue;
 			}
-			if (not_a_word)
-				write(1, last, line-last);
-			else
-				check_and_print(hunhandle, last, line-last);
-			not_a_word = false;
-			last = line;
-			begin = NULL;
+			/* fallthrough */
+		default:
+			switch (st->state) {
+			case Escape:
+				handle_escape(st, c);
+				continue;
+			case Word:
+				check_and_print(st);
+				last = buf;
+				break;
+			}
+			switch (c) {
+			case '\n':
+				st->state = Newline;
+				continue;
+			case '\033':
+				st->state = Escape;
+				st->esclen = 1;
+				st->escape[0] = '\033';
+				continue;
+			default:
+				st->state = Noise;
+				continue;
+			}
 		}
 	}
-	if (begin) {
-		write(1, "<", 1);
-		write(1, last, line-last);
-		write(1, ">", 1);
-	} else {
-		write(1, last, line-last);
-	}
+
+	// We always flush the buffer at at the end
+	if (st->state != Word && last < buf)
+		write(1, last, buf-last);
 }
 
 static void exec_less(char **argv)
@@ -100,18 +166,12 @@ static void exec_less(char **argv)
 	exit(1);
 }
 
-// Note: for longer lines, we'll just break at random
-// points.
-//
-// I simply don't care enough about spell checking
-// for that kind of input, so I'm being intentionally
-// lazy
-#define MAX_LINE_LENGTH 1024
+#define BUFSIZE 1024
 
 int main(int argc, char **argv)
 {
 	int fd[2];
-	char line[MAX_LINE_LENGTH];
+	char buf[BUFSIZE];
 
 	if (isatty(0))
 		exec_less(argv);
@@ -131,13 +191,26 @@ int main(int argc, char **argv)
 	close(fd[0]);
 	close(fd[1]);
 
-	while (fgets(line, sizeof(line), stdin) != NULL) {
-		if (!hunhandle) {
-			fputs(line, stdout);
-			continue;
-		}
-		print_one_line(hunhandle, line);
+	struct state state = {
+		.hunhandle = hunhandle,
+		.state = Newline,
+		.resetlen = strlen(STOP),
+		.reset = STOP,
+	};
+
+	for (;;) {
+		ssize_t len = read(0, buf, sizeof(buf));
+		if (len <= 0)
+			break;
+
+		process(&state, buf, len);
 	}
+
+	// process() flushes the input buffer at the
+	// end, but will leave any partial words for
+	// the next iteration. Deal with that here.
+	if (state.state == Word)
+		check_and_print(&state);
 
 	Hunspell_destroy(hunhandle);
 
