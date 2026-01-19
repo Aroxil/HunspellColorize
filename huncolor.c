@@ -3,7 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <hunspell/hunspell.h>
+
+#include <hunspell.h>
 
 const char *aff_path = "/usr/share/hunspell/en_US.aff";
 const char *dic_path = "/usr/share/hunspell/en_US.dic";
@@ -136,6 +137,8 @@ static void process(struct state *st, const char *buf, size_t len)
 			case Word:
 				check_and_print(st);
 				last = buf;
+				break;
+			default:
 				break;
 			}
 			switch (c) {

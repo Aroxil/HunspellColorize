@@ -1,5 +1,10 @@
+CC = gcc
+CFLAGS = -O2 -Wall
+
+CFLAGS += $(shell pkg-config --cflags hunspell)
+LDLIBS += $(shell pkg-config --libs hunspell)
+
 huncolor: huncolor.o
-huncolor: LDLIBS=-lhunspell-1.7
 huncolor.o: huncolor.c
 
 install: huncolor
